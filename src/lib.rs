@@ -258,6 +258,11 @@ fn plan_label<'a>(
         // We have written this label before. If it still reads back as what we
         // wrote, it is ours to update; otherwise the user renamed it by hand.
         Some(previous) if previous == current => {}
+        // …unless it reads back as a Herdr default. Nobody renames a tab *to*
+        // its own number, so this is a rename of ours that has not landed yet
+        // (concurrent events can observe the label mid-flight). Re-issue rather
+        // than mistaking our own lag for the user's intent.
+        Some(_) if is_default_label(current, number) => {}
         Some(_) => {
             state.release(id);
             return None;
@@ -652,6 +657,31 @@ mod tests {
             names("other", "other")
         });
         assert!(plan_three.tabs.is_empty());
+    }
+
+    #[test]
+    fn a_rename_still_in_flight_is_not_mistaken_for_a_manual_one() {
+        let mut state = State::default();
+
+        // Adopt and rename.
+        let first = simple_snapshot("1", "1", "/Users/adam/dev/app");
+        assert_eq!(
+            plan(&first, &Config::default(), &mut state, Some(HOME), |_| {
+                names("app", "app")
+            })
+            .tabs
+            .len(),
+            1
+        );
+
+        // A concurrent event sees the label before the rename has landed. The
+        // default label is proof it is still ours, not the user's doing.
+        let racing = simple_snapshot("1", "1", "/Users/adam/dev/app");
+        let plan_two = plan(&racing, &Config::default(), &mut state, Some(HOME), |_| {
+            names("app", "app")
+        });
+        assert!(!state.released.contains(&"w1:t1".to_string()));
+        assert_eq!(plan_two.tabs[0].label, "app");
     }
 
     #[test]

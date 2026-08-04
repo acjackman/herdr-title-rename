@@ -1,0 +1,74 @@
+id = "acjackman.title-rename"
+name = "Title & Rename"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "tmux-style window titles (workspace | tab | ~/path) and automatic tab/workspace renaming."
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+# Run once when the server starts so the title is right before any event fires.
+[[startup]]
+command = ["./target/release/herdr-title-rename"]
+
+# `pane.updated` is the one that carries directory changes: it fires when a
+# pane's terminal title changes, which is what a shell emits on `cd`. Without
+# it the title only refreshes on focus changes.
+[[events]]
+on = "pane.updated"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "pane.focused"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "pane.created"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "pane.closed"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "pane.moved"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "workspace.focused"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "workspace.created"
+command = ["./target/release/herdr-title-rename"]
+
+# Renames are how a manual rename is noticed: the label no longer matches what
+# the plugin last wrote, so the plugin hands that label back to you.
+[[events]]
+on = "workspace.renamed"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "tab.focused"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "tab.created"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "tab.renamed"
+command = ["./target/release/herdr-title-rename"]
+
+[[actions]]
+id = "refresh"
+title = "Refresh title and names"
+contexts = ["workspace", "tab", "pane"]
+command = ["./target/release/herdr-title-rename"]
+
+[[actions]]
+id = "clear"
+title = "Clear the window title"
+contexts = ["workspace", "tab", "pane"]
+command = ["./target/release/herdr-title-rename", "--clear"]

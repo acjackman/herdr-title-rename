@@ -1,0 +1,6 @@
+# Every key is optional; these are the defaults, which reproduce the tmux
+# `#S | #W | ~/path` title format.
+separator = " | "
+path_style = "tilde"  # tilde | full | basename | none
+rename_tabs = true
+rename_workspaces = true

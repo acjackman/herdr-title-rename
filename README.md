@@ -117,8 +117,24 @@ herdr plugin action invoke acjackman.title-rename.clear
 
 Herdr runs the binary on each subscribed event; there is no daemon and no
 polling. A run is one `session.snapshot` request, a few `git` calls, and at most
-three writes. Directory changes arrive via `pane.updated`, which Herdr emits
-when a pane's terminal title changes — what a shell does on `cd`.
+three writes.
+
+### Known limitation: a bare `cd` does not refresh
+
+Herdr's plugin manifest accepts a **narrower** set of events than its socket
+API. `pane.updated` — the event that carries a pane's directory and terminal
+title changes — is valid for `events.subscribe` over the socket but is rejected
+in a manifest, with `unknown event 'pane.updated'` logged at install. Verified
+against Herdr 0.7.5 by linking a probe manifest; also rejected are
+`layout.updated`, `pane.cwd_changed`, `pane.output_changed`, `pane.renamed`,
+`pane.scroll_changed`, `pane.title_changed`, and `workspace.metadata_updated`.
+
+Consequence: the title and tab names refresh when focus or session structure
+changes, but not when you `cd` inside a pane you are already looking at. Switch
+panes, tabs, or workspaces and it catches up; or run the `refresh` action.
+
+The fix is a long-lived watcher holding a socket subscription to `pane.updated`,
+started from `[[startup]]` — planned, not implemented.
 
 State (which labels the plugin owns) lives in `HERDR_PLUGIN_STATE_DIR`, guarded
 by a lock file so concurrent events do not clobber each other.

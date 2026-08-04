@@ -12,13 +12,14 @@ command = ["cargo", "build", "--release", "--locked"]
 [[startup]]
 command = ["./target/release/herdr-title-rename"]
 
-# `pane.updated` is the one that carries directory changes: it fires when a
-# pane's terminal title changes, which is what a shell emits on `cd`. Without
-# it the title only refreshes on focus changes.
-[[events]]
-on = "pane.updated"
-command = ["./target/release/herdr-title-rename"]
-
+# Only these event names are honoured in a plugin manifest. `pane.updated` —
+# the one that carries directory changes — is accepted by the socket API's
+# events.subscribe but NOT here; herdr logs `unknown event` and drops it.
+# Verified against 0.7.5 by linking a probe manifest: layout.updated,
+# pane.cwd_changed, pane.output_changed, pane.renamed, pane.scroll_changed,
+# pane.title_changed, pane.updated, and workspace.metadata_updated are all
+# rejected. So a bare `cd` cannot wake this plugin through an event hook;
+# refreshes happen on focus and structure changes instead.
 [[events]]
 on = "pane.focused"
 command = ["./target/release/herdr-title-rename"]
@@ -59,6 +60,34 @@ command = ["./target/release/herdr-title-rename"]
 
 [[events]]
 on = "tab.renamed"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "tab.closed"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "tab.moved"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "workspace.updated"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "workspace.closed"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "workspace.moved"
+command = ["./target/release/herdr-title-rename"]
+
+[[events]]
+on = "worktree.opened"
 command = ["./target/release/herdr-title-rename"]
 
 [[actions]]

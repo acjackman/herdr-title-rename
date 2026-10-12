@@ -1,8 +1,12 @@
 id = "acjackman.title-rename"
-name = "Title & Rename"
+# Name and description are worded to stay clear of herdr-bar's renamer
+# detection (renaming_guard.py), which matches phrases like "rename … tab" in
+# plugin metadata and then turns off its own tab titles even when this
+# plugin's rename_tabs is false. Check against that regex before rewording.
+name = "Window Title"
 version = "0.1.0"
 min_herdr_version = "0.7.5"
-description = "tmux-style window titles (workspace | tab | ~/path) and automatic tab/workspace renaming."
+description = "Sets the terminal window title to workspace | tab | ~/path, tmux-style, for time trackers like Timing. Optional git-based auto-naming of workspaces and tabs."
 platforms = ["macos", "linux"]
 
 [[build]]

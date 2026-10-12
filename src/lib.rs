@@ -424,7 +424,7 @@ fn build_title(
         effective_tab
             .get(tab.tab_id.as_str())
             .cloned()
-            .unwrap_or_else(|| tab.label.clone())
+            .unwrap_or_else(|| strip_status_prefix(&tab.label).to_string())
     });
     let path = pane.map(|pane| render_path(&pane.cwd, config.path_style, home));
 
@@ -469,9 +469,151 @@ pub fn basename(path: &str) -> &str {
     }
 }
 
+/// Glyphs herdr-bar's `tab_status` puts in front of an agent tab's name.
+const STATUS_GLYPHS: [char; 5] = ['◉', '◐', '●', '✓', '○'];
+
+/// Drop herdr-bar's live status prefix — `<logo>  <glyph> ` or `<glyph> ` —
+/// from a tab label. The glyph flips with every agent state change; left in,
+/// the window title would flap and break time-tracker rules matched on it.
+/// The logo is a private-use codepoint from the Herdr Agent Icons font.
+pub fn strip_status_prefix(label: &str) -> &str {
+    let mut chars = label.chars();
+    let after_logo = match chars.next() {
+        Some(logo) if ('\u{E000}'..='\u{F8FF}').contains(&logo) => {
+            chars.as_str().strip_prefix("  ").unwrap_or(label)
+        }
+        _ => label,
+    };
+    let mut chars = after_logo.chars();
+    match chars.next() {
+        Some(glyph) if STATUS_GLYPHS.contains(&glyph) => {
+            chars.as_str().strip_prefix(' ').unwrap_or(label)
+        }
+        _ => label,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watcher — follows `pane.updated`, which a plugin manifest cannot subscribe to
+// ---------------------------------------------------------------------------
+
+pub const PLUGIN_ID: &str = "acjackman.title-rename";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneCwd {
+    pub pane_id: String,
+    pub cwd: String,
+}
+
+/// The pane and directory from a `pane_updated` event line; `None` for
+/// anything else on the stream.
+pub fn pane_cwd_from_event(line: &str) -> Option<PaneCwd> {
+    #[derive(Deserialize)]
+    struct Event {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        pane: Option<EventPane>,
+    }
+    #[derive(Deserialize)]
+    struct EventPane {
+        pane_id: String,
+        #[serde(default)]
+        cwd: String,
+    }
+    let pane = serde_json::from_str::<Event>(line).ok()?.data?.pane?;
+    Some(PaneCwd {
+        pane_id: pane.pane_id,
+        cwd: pane.cwd,
+    })
+}
+
+/// Last known directory per pane. `pane.updated` fires for agent status,
+/// scrolling and terminal-title changes too — about one event a second with
+/// an agent working — so only a real directory change is worth a refresh.
+#[derive(Debug, Default)]
+pub struct CwdTracker {
+    cwds: HashMap<String, String>,
+}
+
+impl CwdTracker {
+    /// Start from the snapshot, so a pane's first event is not taken as a `cd`.
+    pub fn seed(snapshot: &Snapshot) -> Self {
+        Self {
+            cwds: snapshot
+                .panes
+                .iter()
+                .map(|pane| (pane.pane_id.clone(), pane.cwd.clone()))
+                .collect(),
+        }
+    }
+
+    /// Record `cwd`; true when it differs from what this pane last had.
+    pub fn observe(&mut self, pane_id: &str, cwd: &str) -> bool {
+        if cwd.trim().is_empty() || self.cwds.get(pane_id).map(String::as_str) == Some(cwd) {
+            return false;
+        }
+        self.cwds.insert(pane_id.to_string(), cwd.to_string());
+        true
+    }
+}
+
+/// Whether this plugin is still installed and enabled — the watcher outlives
+/// the run that started it, so it checks before acting.
+pub fn plugin_enabled_from_response(raw: &str) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        result: Option<Body>,
+        error: Option<serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Body {
+        #[serde(default)]
+        plugins: Vec<Plugin>,
+    }
+    #[derive(Deserialize)]
+    struct Plugin {
+        plugin_id: Option<String>,
+        #[serde(default)]
+        enabled: bool,
+    }
+    let envelope: Envelope =
+        serde_json::from_str(raw).map_err(|error| format!("malformed API response: {error}"))?;
+    if let Some(error) = envelope.error {
+        return Err(format!("API error: {error}"));
+    }
+    Ok(envelope
+        .result
+        .map(|body| {
+            body.plugins
+                .iter()
+                .any(|plugin| plugin.plugin_id.as_deref() == Some(PLUGIN_ID) && plugin.enabled)
+        })
+        .unwrap_or(false))
+}
+
 // ---------------------------------------------------------------------------
 // Requests
 // ---------------------------------------------------------------------------
+
+pub fn events_subscribe_request() -> String {
+    serde_json::json!({
+        "id": "herdr-title-rename:events",
+        "method": "events.subscribe",
+        "params": { "subscriptions": [{ "type": "pane.updated" }] },
+    })
+    .to_string()
+}
+
+pub fn plugin_list_request() -> String {
+    serde_json::json!({
+        "id": "herdr-title-rename:plugins",
+        "method": "plugin.list",
+        "params": {},
+    })
+    .to_string()
+}
 
 pub fn session_snapshot_request() -> String {
     serde_json::json!({
@@ -834,7 +976,95 @@ mod tests {
     }
 
     #[test]
+    fn status_prefixes_are_kept_out_of_the_title() {
+        // herdr-bar's `tab_status` leads agent tabs with `<logo>  <glyph> `.
+        assert_eq!(strip_status_prefix("\u{E1A0}  ◐ Fix OAuth"), "Fix OAuth");
+        assert_eq!(strip_status_prefix("✓ chezmoi"), "chezmoi");
+        assert_eq!(strip_status_prefix("◉ ●"), "●");
+        // Anything that is not a whole prefix stays as it is.
+        assert_eq!(strip_status_prefix("chezmoi"), "chezmoi");
+        assert_eq!(strip_status_prefix("✓chezmoi"), "✓chezmoi");
+        assert_eq!(
+            strip_status_prefix("\u{E1A0}  chezmoi"),
+            "\u{E1A0}  chezmoi"
+        );
+        assert_eq!(strip_status_prefix(""), "");
+
+        let snapshot = simple_snapshot("chezmoi", "\u{E1A0}  ◐ Fix OAuth", "/Users/adam/dev/app");
+        let config = Config {
+            rename_tabs: false,
+            rename_workspaces: false,
+            ..Config::default()
+        };
+        let plan = plan(
+            &snapshot,
+            &config,
+            &mut State::default(),
+            Some(HOME),
+            |_| Names::default(),
+        );
+        assert_eq!(
+            plan.title.as_deref(),
+            Some("chezmoi | Fix OAuth | ~/dev/app")
+        );
+    }
+
+    #[test]
+    fn pane_updated_events_carry_the_directory() {
+        let event = r#"{"data":{"pane":{"pane_id":"wD:pE","cwd":"/private/tmp","focused":false},"type":"pane_updated"},"event":"pane_updated"}"#;
+        assert_eq!(
+            pane_cwd_from_event(event),
+            Some(PaneCwd {
+                pane_id: "wD:pE".to_string(),
+                cwd: "/private/tmp".to_string(),
+            })
+        );
+        assert_eq!(
+            pane_cwd_from_event(r#"{"data":{"workspace":{}},"event":"workspace_updated"}"#),
+            None
+        );
+        assert_eq!(
+            pane_cwd_from_event(r#"{"id":"x","result":{"type":"subscription_started"}}"#),
+            None
+        );
+        assert_eq!(pane_cwd_from_event("not json"), None);
+    }
+
+    #[test]
+    fn only_a_changed_directory_counts() {
+        let snapshot = simple_snapshot("w", "t", "/Users/adam/dev/app");
+        let mut tracker = CwdTracker::seed(&snapshot);
+        // pane.updated also fires for agent status, scrolling and terminal titles.
+        assert!(!tracker.observe("w1:p1", "/Users/adam/dev/app"));
+        assert!(tracker.observe("w1:p1", "/Users/adam/dev/other"));
+        assert!(!tracker.observe("w1:p1", "/Users/adam/dev/other"));
+        // A pane we have not seen yet is new information.
+        assert!(tracker.observe("w1:p2", "/tmp"));
+        // An empty directory says nothing.
+        assert!(!tracker.observe("w1:p3", ""));
+    }
+
+    #[test]
+    fn plugin_list_reports_whether_we_are_enabled() {
+        let list = |enabled: bool| {
+            format!(
+                r#"{{"id":"x","result":{{"type":"plugin_list","plugins":[{{"plugin_id":"other","enabled":true}},{{"plugin_id":"{PLUGIN_ID}","enabled":{enabled}}}]}}}}"#
+            )
+        };
+        assert_eq!(plugin_enabled_from_response(&list(true)), Ok(true));
+        assert_eq!(plugin_enabled_from_response(&list(false)), Ok(false));
+        assert_eq!(
+            plugin_enabled_from_response(r#"{"result":{"plugins":[]}}"#),
+            Ok(false)
+        );
+        assert!(plugin_enabled_from_response(r#"{"error":{"code":"nope"}}"#).is_err());
+    }
+
+    #[test]
     fn requests_carry_the_documented_methods() {
+        assert!(events_subscribe_request().contains("\"events.subscribe\""));
+        assert!(events_subscribe_request().contains("\"pane.updated\""));
+        assert!(plugin_list_request().contains("\"plugin.list\""));
         assert!(session_snapshot_request().contains("\"session.snapshot\""));
         assert!(window_title_request(Some("t")).contains("\"client.window_title.set\""));
         assert!(window_title_request(None).contains("\"client.window_title.clear\""));

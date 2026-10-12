@@ -1,27 +1,42 @@
-//! Entry point: one short-lived run per Herdr event.
+//! Entry point: one short-lived run per Herdr event, plus a small watcher.
 //!
 //! Read the session snapshot, work out the renames and the window title, and
-//! apply them. There is no daemon — Herdr invokes the binary on each of the
-//! events declared in `herdr-plugin.toml`, and a run costs one socket round
-//! trip plus a few `git` calls.
+//! apply them. Herdr invokes the binary on each of the events declared in
+//! `herdr-plugin.toml`, and a run costs one socket round trip plus a few `git`
+//! calls.
+//!
+//! A manifest cannot subscribe to `pane.updated`, the only event a bare `cd`
+//! raises, so each run also makes sure one `--watch` process is following it
+//! over the socket. The watcher refreshes when a pane's directory changes and
+//! otherwise sleeps on the stream.
 
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
-use std::time::{Duration, SystemTime};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use herdr_title_rename::{
-    basename, check_response, plan, session_snapshot_request, snapshot_from_response,
-    tab_rename_request, window_title_request, workspace_rename_request, Config, Names, State,
+    basename, check_response, events_subscribe_request, pane_cwd_from_event, plan,
+    plugin_enabled_from_response, plugin_list_request, session_snapshot_request,
+    snapshot_from_response, tab_rename_request, window_title_request, workspace_rename_request,
+    Config, CwdTracker, Names, State,
 };
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 /// A lock older than this is assumed to belong to a run that died.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(5);
+/// Settle time after a directory change: one refresh per burst of events.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Reconnect attempts, a second apart, before deciding the server is gone.
+/// A restarted server's startup hook launches a fresh watcher.
+const WATCH_RECONNECTS: u32 = 10;
+/// The watcher log is truncated at launch once it passes this size.
+const WATCH_LOG_LIMIT: u64 = 256 * 1024;
 
 fn main() -> ExitCode {
     match run() {
@@ -41,11 +56,26 @@ fn run() -> Result<(), String> {
         return check_response(&response);
     }
 
+    if env::args().any(|argument| argument == "--watch") {
+        return watch(&socket);
+    }
+
     // `--dry-run` reports what the run would do and changes nothing — neither
     // the session nor the state file. Useful for checking naming rules against
     // a live session before handing the plugin the keys.
     let dry_run = env::args().any(|argument| argument == "--dry-run");
+    let result = refresh(&socket, dry_run);
 
+    if !dry_run {
+        // Never fails the run: the title above is what matters right now.
+        if let Err(error) = ensure_watcher() {
+            eprintln!("watcher: {error}");
+        }
+    }
+    result
+}
+
+fn refresh(socket: &Path, dry_run: bool) -> Result<(), String> {
     let config = load_config()?;
     let state_path = state_dir()?.join("state.json");
     let _lock = (!dry_run)
@@ -56,7 +86,7 @@ fn run() -> Result<(), String> {
         .map(|raw| State::parse(&raw))
         .unwrap_or_default();
 
-    let snapshot = snapshot_from_response(&call(&socket, &session_snapshot_request())?)?;
+    let snapshot = snapshot_from_response(&call(socket, &session_snapshot_request())?)?;
     let home = env::var("HOME").ok();
 
     // `plan` asks for the same directory more than once (a tab and its
@@ -92,18 +122,15 @@ fn run() -> Result<(), String> {
     // the title is the part time tracking depends on.
     let mut failures = Vec::new();
     for rename in &plan.tabs {
-        if let Err(error) = call(&socket, &tab_rename_request(&rename.id, &rename.label))
+        if let Err(error) = call(socket, &tab_rename_request(&rename.id, &rename.label))
             .and_then(|response| check_response(&response))
         {
             failures.push(format!("tab {}: {error}", rename.id));
         }
     }
     for rename in &plan.workspaces {
-        if let Err(error) = call(
-            &socket,
-            &workspace_rename_request(&rename.id, &rename.label),
-        )
-        .and_then(|response| check_response(&response))
+        if let Err(error) = call(socket, &workspace_rename_request(&rename.id, &rename.label))
+            .and_then(|response| check_response(&response))
         {
             failures.push(format!("workspace {}: {error}", rename.id));
         }
@@ -111,7 +138,7 @@ fn run() -> Result<(), String> {
 
     let title = plan.title.as_deref();
     let title_result =
-        call(&socket, &window_title_request(title)).and_then(|response| check_response(&response));
+        call(socket, &window_title_request(title)).and_then(|response| check_response(&response));
 
     // Herdr records stdout per plugin run, so this line is the log.
     println!("{}", title.unwrap_or("(cleared)"));
@@ -225,6 +252,184 @@ fn command(directory: &str, program: &str, arguments: &[&str]) -> Option<String>
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Watcher — a bare `cd` only reaches us over the socket
+// ---------------------------------------------------------------------------
+
+enum Stop {
+    /// The server closed the stream (restart, live handoff): reconnect.
+    Closed,
+    /// The plugin was disabled or uninstalled: exit.
+    Disabled,
+    /// The binary was rebuilt under us (reinstall): re-exec the new one.
+    Upgraded,
+}
+
+/// Start the watcher unless one is already running. Probing its lock decides;
+/// the watcher takes the same lock itself, so a lost race only means the
+/// second one exits straight away.
+fn ensure_watcher() -> Result<(), String> {
+    let directory = state_dir()?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    if open_lock(&directory.join("watcher.lock"))?
+        .try_lock()
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let log_path = directory.join("watcher.log");
+    let oversized = fs::metadata(&log_path)
+        .map(|metadata| metadata.len() > WATCH_LOG_LIMIT)
+        .unwrap_or(false);
+    let mut options = fs::OpenOptions::new();
+    if oversized {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    let log = options
+        .create(true)
+        .open(&log_path)
+        .map_err(|error| format!("cannot open {}: {error}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|error| format!("cannot open {}: {error}", log_path.display()))?;
+
+    let exe = env::current_exe().map_err(|error| format!("cannot locate binary: {error}"))?;
+    Command::new(exe)
+        .arg("--watch")
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err)
+        // Its own process group, so it is not torn down with this run.
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("cannot start: {error}"))?;
+    Ok(())
+}
+
+fn watch(socket: &Path) -> Result<(), String> {
+    let directory = state_dir()?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let lock = open_lock(&directory.join("watcher.lock"))?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+
+    let exe = env::current_exe().map_err(|error| format!("cannot locate binary: {error}"))?;
+    let built = modified(&exe);
+    eprintln!("watching {}", socket.display());
+
+    let mut failures = 0;
+    loop {
+        match follow(socket, &exe, built) {
+            Ok(Stop::Closed) => failures = 0,
+            Ok(Stop::Disabled) => {
+                eprintln!("plugin disabled; stopping");
+                return Ok(());
+            }
+            Ok(Stop::Upgraded) => {
+                eprintln!("binary changed; restarting");
+                drop(lock);
+                // `exec` only returns on failure.
+                let error = Command::new(&exe).arg("--watch").exec();
+                return Err(format!("cannot restart: {error}"));
+            }
+            Err(error) => {
+                failures += 1;
+                if failures >= WATCH_RECONNECTS {
+                    return Err(format!("giving up: {error}"));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Follow one subscription until it ends, refreshing on directory changes.
+fn follow(socket: &Path, exe: &Path, built: Option<SystemTime>) -> Result<Stop, String> {
+    let stream = UnixStream::connect(socket)
+        .map_err(|error| format!("cannot connect to {}: {error}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(API_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(API_TIMEOUT)))
+        .map_err(|error| format!("cannot configure socket: {error}"))?;
+    let mut writer = &stream;
+    writeln!(writer, "{}", events_subscribe_request())
+        .map_err(|error| format!("cannot subscribe: {error}"))?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = Vec::new();
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("cannot subscribe: {error}"))?;
+    check_response(&String::from_utf8_lossy(&line))?;
+    line.clear();
+
+    // Seed after subscribing, so no change can fall between the two.
+    let snapshot = snapshot_from_response(&call(socket, &session_snapshot_request())?)?;
+    let mut tracker = CwdTracker::seed(&snapshot);
+    // Catch up on whatever changed while nobody was listening: a server
+    // restart, or the change that made the previous binary re-exec.
+    if let Err(error) = refresh(socket, false) {
+        eprintln!("refresh: {error}");
+    }
+
+    // From here the read timeout is a tick for the debounce, not a deadline.
+    stream
+        .set_read_timeout(Some(WATCH_DEBOUNCE))
+        .map_err(|error| format!("cannot configure socket: {error}"))?;
+    let mut due: Option<Instant> = None;
+    loop {
+        // A timeout can land mid-line; `read_until` keeps what it has read in
+        // `line`, so it is cleared only once a whole event is handled.
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => return Ok(Stop::Closed),
+            Ok(_) => {
+                if let Some(pane) = pane_cwd_from_event(&String::from_utf8_lossy(&line)) {
+                    if tracker.observe(&pane.pane_id, &pane.cwd) {
+                        due.get_or_insert_with(|| Instant::now() + WATCH_DEBOUNCE);
+                    }
+                }
+                line.clear();
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => return Err(format!("event stream: {error}")),
+        }
+
+        if due.is_some_and(|due| Instant::now() >= due) {
+            due = None;
+            if !plugin_enabled_from_response(&call(socket, &plugin_list_request())?)? {
+                return Ok(Stop::Disabled);
+            }
+            if modified(exe) != built {
+                return Ok(Stop::Upgraded);
+            }
+            if let Err(error) = refresh(socket, false) {
+                eprintln!("refresh: {error}");
+            }
+        }
+    }
+}
+
+fn open_lock(path: &Path) -> Result<fs::File, String> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 // ---------------------------------------------------------------------------

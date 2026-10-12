@@ -12,7 +12,8 @@ platforms = ["macos", "linux"]
 [[build]]
 command = ["cargo", "build", "--release", "--locked"]
 
-# Run once when the server starts so the title is right before any event fires.
+# Run once when the server starts so the title is right before any event fires,
+# and so the `cd` watcher is running from the start.
 [[startup]]
 command = ["./target/release/herdr-title-rename"]
 
@@ -22,8 +23,9 @@ command = ["./target/release/herdr-title-rename"]
 # Verified against 0.7.5 by linking a probe manifest: layout.updated,
 # pane.cwd_changed, pane.output_changed, pane.renamed, pane.scroll_changed,
 # pane.title_changed, pane.updated, and workspace.metadata_updated are all
-# rejected. So a bare `cd` cannot wake this plugin through an event hook;
-# refreshes happen on focus and structure changes instead.
+# rejected. So a bare `cd` cannot wake this plugin through an event hook: each
+# run also keeps a `--watch` process subscribed to it over the socket instead
+# (see README, "Following cd").
 [[events]]
 on = "pane.focused"
 command = ["./target/release/herdr-title-rename"]

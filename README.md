@@ -115,11 +115,10 @@ herdr plugin action invoke acjackman.title-rename.clear
 
 ## How it works
 
-Herdr runs the binary on each subscribed event; there is no daemon and no
-polling. A run is one `session.snapshot` request, a few `git` calls, and at most
-three writes.
+Herdr runs the binary on each subscribed event. A run is one `session.snapshot`
+request, a few `git` calls, and at most three writes.
 
-### Known limitation: a bare `cd` does not refresh
+### Following `cd`: the watcher
 
 Herdr's plugin manifest accepts a **narrower** set of events than its socket
 API. `pane.updated` — the event that carries a pane's directory and terminal
@@ -129,12 +128,27 @@ against Herdr 0.7.5 by linking a probe manifest; also rejected are
 `layout.updated`, `pane.cwd_changed`, `pane.output_changed`, `pane.renamed`,
 `pane.scroll_changed`, `pane.title_changed`, and `workspace.metadata_updated`.
 
-Consequence: the title and tab names refresh when focus or session structure
-changes, but not when you `cd` inside a pane you are already looking at. Switch
-panes, tabs, or workspaces and it catches up; or run the `refresh` action.
+So every run also makes sure one `--watch` process is running (a lock file in
+`HERDR_PLUGIN_STATE_DIR` keeps it to one). It holds a socket subscription to
+`pane.updated` and refreshes ~150 ms after a pane's directory changes.
+`pane.updated` also fires for agent status, scrolling and terminal titles —
+about once a second with an agent working — so those are ignored; idle, the
+watcher just sleeps on the socket. It:
 
-The fix is a long-lived watcher holding a socket subscription to `pane.updated`,
-started from `[[startup]]` — planned, not implemented.
+- reconnects across a server restart or live handoff, and exits once the
+  server has been gone for ~10 s (the next server's startup run starts a new
+  one);
+- exits when the plugin is disabled or uninstalled (checked before each
+  refresh);
+- re-execs itself when the binary is rebuilt, e.g. by a reinstall.
+
+It logs to `watcher.log` in the state directory.
+
+### herdr-bar status prefixes
+
+[herdr-bar](https://github.com/jeffarese/herdr-bar)'s `tab_status` writes a
+live status into tab labels (`<logo>  ◐ name`). The title drops that prefix, so
+it stays steady as agents change state instead of flapping with every glyph.
 
 State (which labels the plugin owns) lives in `HERDR_PLUGIN_STATE_DIR`, guarded
 by a lock file so concurrent events do not clobber each other.
